@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>簡易画像ビュアー</title>
+</head>
+
+<script id="vert" type="x-shader/x-vertex">#version 300 es
+uniform vec2 u_sizeVp;
+uniform vec2 u_sizeImg;
+uniform vec2 u_offset;
+uniform float u_zoom;
+
+uniform vec4 u_tex2vp;
+layout (location = 0) in vec2 a_texCoord;
+out vec2 v_texCoord;
+
+void main() 
+{
+	vec2 center = floor(u_sizeVp * 0.5);
+	vec2 base = floor(u_sizeImg * u_zoom * 0.5);
+
+	vec2 org = (center - base + u_offset) / u_sizeVp;
+	vec2 rc = (u_sizeImg * u_zoom) / u_sizeVp;
+
+	gl_Position = vec4((a_texCoord * rc + org) * vec2(2.0, -2.0) - vec2(1.0, -1.0), 0.0, 1.0);
+	gl_PointSize = 16.0;
+	v_texCoord = a_texCoord;
+}
+</script>
+
+<script id="frag" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+uniform sampler2D u_texSrc;	// 元画像
+in vec2 v_texCoord;
+out vec4 outColor;
+void main()
+{
+	outColor = texture(u_texSrc, v_texCoord);
+}
+</script>
+
+<script id="fragGrid" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+uniform sampler2D u_texSrc;	// 元画像
+
+out vec4 outColor;
+void main()
+{
+	outColor = vec4(0.75, 0.75, 0.75, 0.5);
+}
+</script>
+
+<script id="fragIcon" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+uniform sampler2D u_texSrc;	// 元画像
+
+out vec4 outColor;
+void main()
+{
+	outColor = texture(u_texSrc, gl_PointCoord);
+}
+</script>
+
+<script type="text/javascript">
+var can;
+var gl;
+var prog0;
+var prog1;
+var prog2;
+
+var a_texCoord;
+var b_texCoord;
+
+var arg;
+var viewCount = 1;
+var view = [];
+var u_sizeVp;
+var u_tex2vp;
+
+var pages = [];
+
+var texS;
+var texT;
+var texU;
+var texI;
+
+var state;
+var mark;
+
+const coordOffset = [-1800, -1500];
+const coordScale = [10 / 3, -10 / 3];
+
+async function webMain()
+{
+	can = document.getElementById("webGL");
+	gl  = setupGL(can);
+	initialize();
+
+	let param = (new URL(document.location)).searchParams;
+	arg = new Object;
+	arg.col = param.get('col') ?? 1;
+	arg.row = param.get('row') ?? 1;
+
+	viewCount = arg.col * arg.row;
+
+	prog0 = Prog("vert", "frag");
+	prog1 = Prog("vert", "fragGrid");
+	prog2 = Prog("vert", "fragIcon");
+
+	u_sizeVp = [1, 1];
+
+	fit();
+
+	// マウス操作の初期化
+	mouseOperation(can);
+
+	mark = loadSettings() ?? [];
+
+	Promise.all([
+		loadTexture(texS, "ToK_locS.png"),
+		loadTexture(texT, "ToK_locT.png"),
+		loadTexture(texU, "ToK_locU.png"),
+		loadTexture(texI, "ToK_icon.png")
+	]).then((r) => {
+		pages.push({ tex: texS, width: r[0][0], height: r[0][1] });
+		pages.push({ tex: texT, width: r[1][0], height: r[1][1] });
+		pages.push({ tex: texU, width: r[2][0], height: r[2][1] });
+
+		updateView();
+	});
+
+}
+
+function resize()
+{
+	fit();
+	updateView();
+}
+
+//---------------------------------------------------
+//	WebGLの初期化
+function setupGL(can)
+{
+//	let gl  = can.getContext("webgl2", { preserveDrawingBuffer: true });
+	let gl  = can.getContext("webgl2");
+	let checkParameter = (p) => console.log(p + ':' + gl.getParameter(gl[p]));
+	let checkExtension = (e) => console.log(e + ':' + (gl.getExtension(e) !== null ? " supported" : " not supported"));
+
+	can.addEventListener('webglcontextlost', function(e) {
+		console.log(e);
+	}, false);
+
+	can.addEventListener('webglcontextrestored', function(e) {
+		console.log(e);
+	}, false);
+
+	checkParameter('MIN_PROGRAM_TEXEL_OFFSET');
+	checkParameter('MAX_PROGRAM_TEXEL_OFFSET');
+
+	// float texture を有効化
+	checkExtension('OES_texture_float');
+	checkExtension('OES_texture_float_linear');	// OES_texture_float_linearに対応していないとUNSIGNED_BYTE以外のテクスチャは線形補間が使えない
+	checkExtension('EXT_color_buffer_float');
+
+	gl.enable(gl.BLEND);
+	gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.SRC_ALPHA, gl.ONE);
+	gl.clearColor(0, 0, 0, 1);
+
+	return gl;
+}
+
+//---------------------------------------------------
+//	プログラムのコンパイルとリンク
+function Prog(vert, frag, xfb)
+{
+	const vsrc = document.getElementById(vert).textContent;
+	const fsrc = document.getElementById(frag).textContent;
+
+	const vs = gl.createShader(gl.VERTEX_SHADER);
+	const fs = gl.createShader(gl.FRAGMENT_SHADER);
+
+	gl.shaderSource(vs, vsrc);
+	gl.shaderSource(fs, fsrc);
+
+	// シェーダをコンパイルする
+	gl.compileShader(vs);	if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS))	alert(gl.getShaderInfoLog(vs));
+	gl.compileShader(fs);	if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS))	alert(gl.getShaderInfoLog(fs));
+
+	const prog = gl.createProgram();
+	if (!prog)
+	{
+		alert("プログラムオブジェクトの作成に失敗");
+		return null;
+	}
+
+	// シェーダオブジェクトを設定する
+	gl.attachShader(prog, vs);
+	gl.attachShader(prog, fs);
+
+	if (xfb)
+	    gl.transformFeedbackVaryings(prog, xfb, (xfb.length > 1) ? gl.INTERLEAVED_ATTRIBS : gl.SEPARATE_ATTRIBS);
+
+	// プログラムオブジェクトをリンクする
+	gl.linkProgram(prog);
+
+	// リンク結果をチェックする
+	if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+	{
+		alert(gl.getProgramInfoLog(prog));
+		gl.deleteProgram(prog);
+		gl.deleteShader(fs);
+		gl.deleteShader(vs);
+		return null;
+	}
+	return prog;
+}
+
+//---------------------------------------------------
+//	テクスチャをロード
+function loadTexture(tex, src)
+{
+	return new Promise((resolve, reject) =>
+	{
+		let image = new Image();
+		image.onload = () => {
+			gl.activeTexture(gl.TEXTURE0);
+			gl.bindTexture(gl.TEXTURE_2D, tex);
+			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+			resolve([image.width, image.height]);
+		}
+		image.src = src;
+	});
+}
+
+
+//---------------------------------------------------
+//	各種初期化処理
+function initialize()
+{
+	texS = gl.createTexture();
+	texT = gl.createTexture();
+	texU = gl.createTexture();
+	texI = gl.createTexture();
+
+	state = { page: 0, zoom: 1, fit: true };
+
+	a_texCoord = new Float32Array([
+	//	ビュー全体を覆う四角形
+		0.0, 0.0,
+		0.0, 1.0,
+		1.0, 0.0,
+		1.0, 1.0,
+	//	経緯線
+		0.0, 0.1, 1.0, 0.1,
+		0.0, 0.2, 1.0, 0.2,
+		0.0, 0.3, 1.0, 0.3,
+		0.0, 0.4, 1.0, 0.4,
+		0.0, 0.5, 1.0, 0.5,
+		0.0, 0.6, 1.0, 0.6,
+		0.0, 0.7, 1.0, 0.7,
+		0.0, 0.8, 1.0, 0.8,
+		0.0, 0.9, 1.0, 0.9,
+		1 /12, 0.0, 1 /12, 1.0,
+		2 /12, 0.0, 2 /12, 1.0,
+		3 /12, 0.0, 3 /12, 1.0,
+		4 /12, 0.0, 4 /12, 1.0,
+		5 /12, 0.0, 5 /12, 1.0,
+		6 /12, 0.0, 6 /12, 1.0,
+		7 /12, 0.0, 7 /12, 1.0,
+		8 /12, 0.0, 8 /12, 1.0,
+		9 /12, 0.0, 9 /12, 1.0,
+		10/12, 0.0, 10/12, 1.0,
+		11/12, 0.0, 11/12, 1.0
+		]);
+	// バッファオブジェクトを作成する
+	b_texCoord = gl.createBuffer();
+	// 頂点座標、テクスチャ座標をバッファオブジェクトに書きこむ
+	gl.bindBuffer(gl.ARRAY_BUFFER, b_texCoord);
+	gl.bufferData(gl.ARRAY_BUFFER, a_texCoord, gl.STATIC_DRAW);
+	// バッファオブジェクトのバインドを解除する
+	gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+	u_tex2vp = new Float32Array([2,-2,-1,1]);
+}
+
+//---------------------------------------------------
+// 表示情報の更新
+function updateView()
+{
+	align();
+	gl.viewport(0, 0, ...u_sizeVp);
+	gl.clear(gl.COLOR_BUFFER_BIT);	// Canvasをクリアする
+
+	let prog = prog0;
+	gl.useProgram(prog);
+
+	gl.bindBuffer(gl.ARRAY_BUFFER, b_texCoord);
+	gl.vertexAttribPointer(0, 2, gl.FLOAT, false, a_texCoord.BYTES_PER_ELEMENT * 2, 0);
+	gl.enableVertexAttribArray(0);	// バッファオブジェクトの割り当ての有効化
+
+	let p = state.page ?? 0;
+	gl.activeTexture(gl.TEXTURE0);
+	gl.bindTexture(gl.TEXTURE_2D, pages[p].tex);
+	gl.uniform1i(gl.getUniformLocation(prog, 'u_texSrc'), 0);
+	gl.uniform4fv(gl.getUniformLocation(prog, 'u_tex2vp'), u_tex2vp);
+	gl.uniform2fv(gl.getUniformLocation(prog, 'u_sizeVp'), u_sizeVp);
+	gl.uniform2f(gl.getUniformLocation(prog, 'u_sizeImg'), pages[p].width, pages[p].height);
+	gl.uniform2f(gl.getUniformLocation(prog, 'u_offset'), moveX, moveY);
+	gl.uniform1f(gl.getUniformLocation(prog, 'u_zoom'), state.zoom);
+
+	// 四角形を描画する
+	gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+	prog = prog1;
+	gl.useProgram(prog);
+
+	gl.uniform4fv(gl.getUniformLocation(prog, 'u_tex2vp'), u_tex2vp);
+	gl.uniform2fv(gl.getUniformLocation(prog, 'u_sizeVp'), u_sizeVp);
+	gl.uniform2f(gl.getUniformLocation(prog, 'u_sizeImg'), pages[p].width, pages[p].height);
+	gl.uniform2f(gl.getUniformLocation(prog, 'u_offset'), moveX, moveY);
+	gl.uniform1f(gl.getUniformLocation(prog, 'u_zoom'), state.zoom);
+
+	// 直線を描画する
+	gl.drawArrays(gl.LINES, 4, 40);
+	gl.disableVertexAttribArray(0);	// バッファオブジェクトの割り当ての無効化
+}
+
+
+//---------------------------------------------------
+const zoomStep = [1.0, 0.8, 0.625, 0.5, 0.4, 0.3125, 0.25, 0.2, 0.16, 0.125, 0.1, 0.08, 0.0625, 0.05];
+var zoomIndex = 0;
+var moveX = 0;
+var moveY = 0;
+
+function clientPos(ev)
+{
+	let rect = ev.target.getBoundingClientRect();
+	return {
+		x:ev.clientX - rect.left,
+		y:ev.clientY - rect.top,
+		w:rect.width,
+		h:rect.height};
+}
+
+function initOffset(clientSize, imageSize)
+{
+	if (clientSize.width >= imageSize.width && clientSize.height >= imageSize.height) {
+		state.zoom = 1.0;
+		state.fit = false;
+	} else if (clientSize.width * imageSize.height < clientSize.height * imageSize.width) {
+		state.zoom = clientSize.width / imageSize.width;
+		state.fit = true;
+	} else {
+		state.zoom = clientSize.height / imageSize.height;
+		state.fit = true;
+	}
+
+	return [0, 0];
+}
+
+function align()
+{
+	let p = state.page ?? 0;
+	let half = { x: Math.ceil(pages[p].width * state.zoom / 2), y: Math.ceil(pages[p].height * state.zoom / 2) };
+	if (moveX > half.x)	moveX = half.x;
+	if (moveY > half.y)	moveY = half.y;
+	if (moveX < -half.x)	moveX = -half.x;
+	if (moveY < -half.y)	moveY = -half.y;
+}
+
+
+//---------------------------------------------------
+// マウスによる矩形操作
+function mouseOperation(canvas)
+{
+	let xStart, yStart;
+	let prevX, prevY;
+	let flagMouse = 0;
+
+	const MBUTTON_FLAG_LEFT = 1;
+	const MBUTTON_FLAG_RIGHT = 2;
+	const MBUTTON_FLAG_WHEEL = 4;
+	const MBUTTON_FLAG_4TH = 8;
+	const MBUTTON_FLAG_5TH = 16;
+
+	const MBUTTON_LEFT = 0;
+	const MBUTTON_RIGHT = 2;
+	const MBUTTON_WHEEL = 1;
+	const MBUTTON_4TH = 3;
+	const MBUTTON_5TH = 4;
+
+	function update(pos)
+	{
+		xStart	= pos.x;
+		yStart	= pos.y;
+		prevX	= moveX;
+		prevY	= moveY;
+	}
+
+	function start(
+		button,
+		pos)		// clientPos
+	{
+		if (pos.x < 0 || pos.x >= pos.w || pos.y < 0 || pos.y >= pos.h)	//	canvas外
+		{
+			flagMouse = 0;
+			return;
+		}
+		update(pos);
+		flagMouse = button + 1;
+	}
+
+	function scroll(
+		pos,		// clientPos
+		shift)
+	{
+		if (pos.x < -1 || pos.x > pos.w || pos.y < -1 || pos.y > pos.h)	//	canvas外
+		{
+			flagMouse = 0;
+			return;
+		}
+
+		moveX = prevX + (pos.x - xStart);
+		moveY = prevY + (pos.y - yStart);
+
+		updateView();
+	}
+
+	function changeImage(d)
+	{
+		if (pages.length == 0) return;
+		let p = state.page + d;
+		if (p < 0) p = pages.length - 1;
+		if (p >= pages.length) p = 0;
+		state.page = p;
+		updateView();
+	}
+
+	canvas.onmousedown = function(ev)
+	{
+		if (flagMouse)	return;
+		let pos = clientPos(ev);
+		switch (ev.button)
+		{
+		case MBUTTON_RIGHT:
+			start(ev.button, pos);
+			break;
+		case MBUTTON_4TH:
+			changeImage(-1);
+			break;
+		case MBUTTON_5TH:
+			changeImage(1);
+			break;
+		}
+	}
+
+	canvas.onmouseup = function(ev)
+	{
+		flagMouse = 0;
+	}
+
+	canvas.onmouseout = function(ev)
+	{
+		flagMouse = 0;
+		document.getElementById("ctrl").innerHTML = '';
+	}
+
+	canvas.onmousemove = function(ev)
+	{
+		let pos = clientPos(ev);
+
+		if (flagMouse) scroll(pos, ev.shiftKey);
+
+		let p = state.page ?? 0;
+		if (p < pages.length)
+		{
+			let centerX = Math.floor(u_sizeVp[0] * 0.5);
+			let centerY = Math.floor(u_sizeVp[1] * 0.5);
+			let baseX = Math.floor(pages[p].width * state.zoom * 0.5);
+			let baseY = Math.floor(pages[p].height * state.zoom * 0.5);
+			let logicalX = (pos.x - (centerX - baseX + moveX)) / state.zoom;
+			let logicalY = (pos.y - (centerY - baseY + moveY)) / state.zoom;
+			if (logicalX >= 0 && logicalY >= 0 && logicalX < pages[p].width && logicalY < pages[p].height)
+				document.getElementById("ctrl").innerHTML = Math.round((logicalX + coordOffset[0]) * coordScale[0]) + ' ' + Math.round((logicalY + coordOffset[1]) * coordScale[1]);
+			else
+				document.getElementById("ctrl").innerHTML = '';
+		}
+	}
+
+	canvas.oncontextmenu = () => false;
+
+	canvas.onwheel = function(ev)
+	{
+		let pos = clientPos(ev);
+
+		if (ev.deltaY > 0)
+		{
+			zoomIndex += 1;	// zoom in
+			if (zoomIndex >= zoomStep.length)
+				zoomIndex = zoomStep.length - 1;
+		}
+		else if (ev.deltaY < 0)
+		{
+			zoomIndex -= 1;	// zoom out
+			if (zoomIndex <= -zoomStep.length)
+				zoomIndex = -zoomStep.length + 1;
+		}
+
+		let prevZoom = state.zoom;
+		state.zoom = (zoomIndex >= 0) ? (zoomStep[zoomIndex]) : (1 / zoomStep[-zoomIndex]);
+
+		let centerX = Math.floor(u_sizeVp[0] * 0.5);
+		let centerY = Math.floor(u_sizeVp[1] * 0.5);
+		moveX += Math.floor((centerX + moveX - pos.x - 0.5) * (state.zoom / prevZoom - 1) + 0.5);
+		moveY += Math.floor((centerY + moveY - pos.y - 0.5) * (state.zoom / prevZoom - 1) + 0.5);
+
+		updateView();
+	}
+}
+
+//---------------------------------------------------
+function fit()
+{
+	const m = window.getComputedStyle(document.body);
+	u_sizeVp[0] = Math.floor((document.documentElement.clientWidth - parseInt(m.marginLeft, 10) - parseInt(m.marginRight, 10)) / arg.col);
+	u_sizeVp[1] = Math.floor((document.documentElement.clientHeight - parseInt(m.marginTop, 10) - parseInt(m.marginBottom, 10) - 40) / arg.row);
+	can.width	= u_sizeVp[0] * arg.col;
+	can.height	= u_sizeVp[1] * arg.row;
+}
+
+//---------------------------------------------------
+function dragOver(event)
+{
+	event.stopPropagation();
+	event.preventDefault();
+	event.dataTransfer.dropEffect = 'copy';
+}
+//---------------------------------------------------
+async function dropFile(event, view)
+{
+	event.stopPropagation();
+	event.preventDefault();
+	let urlCreator = window.URL || window.webkitURL;
+	if (event.dataTransfer.files.length == 1)
+	{
+		let file = event.dataTransfer.files[0];
+		if (file.type.indexOf('image/') == 0)
+		{
+			await loadTexture(texS, file.name);
+			let reader = new FileReader;
+			reader.addEventListener('load', async (event) =>
+			{
+				let p = state.page ?? 0;
+				[pages[p].width, pages[p].height] = await loadTexture(pages[p].tex, event.target.result);
+				updateView();
+			});
+			reader.readAsDataURL(file);
+		}
+	}
+}
+
+//---------------------------------------------------
+// ローカルストレージ
+function loadForm(id)
+{
+	let val = localStorage.getItem(id);
+	if (val)
+	{
+		document.getElementById(id).innerHTML = val;
+		document.getElementsByName(id)[0].value = val;
+	}
+}
+
+function storeForm(id)
+{
+	localStorage.setItem(id, document.getElementById(id).value);
+}
+
+function loadObj(id)
+{
+	let val = localStorage.getItem(id);
+	if (val)	return JSON.perse(localStorage.getItem(id));
+	return null;
+}
+
+function storeObj(id, obj)
+{
+	localStorage.setItem(id, JSON.stringify(obj));
+}
+
+function loadSettings()
+{
+	mark = loadObj("mark");
+}
+
+function storeSettings()
+{
+	storeObj("mark", mark);
+}
+
+function clearSettings()
+{
+	localStorage.clear();
+}
+
+//---------------------------------------------------
+// エラーハンドラ
+function errorHandler(e)
+{
+	console.log(e.message);
+}
+//---------------------------------------------------
+</script>
+
+<style type = "text/css">
+body{ background-color: white; margin: 0px; overflow-x:hidden; overflow-y:hidden }
+</style>
+
+<body onload="webMain()" onresize="resize()">
+<canvas id='webGL' width='256' height='256' style='border: 0px' ondragover='dragOver(event)' ondrop='dropFile(event)'></canvas>
+
+<input type="button" value="保存" onclick="storeSettings()">
+<input type="button" value="復元" onclick="loadSettings()">
+<input type="button" value="書出" onclick="storeSettings()">
+<input type="button" value="読込" onclick="loadSettings()">
+<input type="button" value="消去" onclick="clearSettings()">
+<span id="ctrl">
+</span>
+
+
+</body>
+</html>
